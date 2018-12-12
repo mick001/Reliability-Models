@@ -1,4 +1,4 @@
-# Reliability-models
+# Reliability Models
 A repository containing scripts related to reliability calculation
 
 More specifically:
