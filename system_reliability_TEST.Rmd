@@ -1,0 +1,464 @@
+---
+title: "Monte Carlo reliability calculation of a parallel system with correlated times to failure using copulas"
+author: "Michy Alice"
+date: "07 February 2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The idea for this work is the following
+
+- Find a system whose components may be affected by correlation between the times to failure (**tfs** for brevity in the following).
+- Determine correlation structure between the **tfs** of the different components by estimating the copula (or choose which copula to use a priori) from experimental data collected from the system.
+- Estimate copula type and parameters (or choose them a priori).
+- Perform Monte Carlo evaluation of system reliability.
+- Compare the results with the case of independent **tfs**.
+- Draw appropriate conclusions.
+
+## Example of application to a simple parallel system
+
+Only reliability and MTTF are computed even though the analysis may be targeted depending on the mission.
+
+### System description
+The system has only 2 components in parallel working in the same operating conditions.
+
+This script aims to model the case where tf1 and tf2 are correlated (but not necessarily dependent).
+
+The correlation structure (usually called in the literature, "dependence structure") is given by the copula.
+ 
+The marginals (i.e. the distribution of the time to failure of each of the components) are independent of the copula. This means that, from a modelling perspective, the same correlation structure can be applied to components with different distribution of the time to failure.
+Different correlation structures can be considered by using different copulas (for example: Gaussian, Gumbel, Frank, etc...). As a sidenote, the case of independence between the two failure rates can be obtained by using an independence copula.
+
+We assume the following:
+
+- The two components have a failure rate distributed according to an exponential distribution with parameter 0.01 years^(-1)
+- The correlation structure is assumed to be a *t-copula* with parameters $df = 1$ and main parameter equal to $rho.1 = -0.8$.
+
+The following code sets up the system and samples the time to failure of each component from the selected copula and marginals.
+
+```{r}
+#-------------------------------------------------------------------------------
+# Boolean table of the system
+
+# Parallel system
+bool_table <- matrix(c(0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1), nrow=4, ncol=3, byrow = T)
+
+#-------------------------------------------------------------------------------
+
+# Time horizon considered for reliability calculation [years]
+T_HORIZON <- 450
+# Time mission considered [years]
+T_M <- 200
+# Time for calculating conditional reliability [years]
+T_COND <- 20
+# Number of Monte Carlo iterations
+N_MC_SIM <- 5000
+# Number of system components
+N_COMP <- ncol(bool_table) - 1
+# For reproducibility
+set.seed(2561)
+# System state matrix
+system_state_matrix <- matlab::zeros(N_MC_SIM, T_HORIZON + 1)
+# Fix equal to 1 element k, 1 of the state matrix for each row since R(0)=1
+system_state_matrix[1:N_MC_SIM, 1] <- 1
+# All possible existing combinations of system state
+ALL_POSSIBLE_STATES <- bool_table[, 1:N_COMP]
+# Working and not working states: working statets are those with 1
+SYS_STATES <- bool_table[, N_COMP + 1]
+
+#-------------------------------------------------------------------------------
+# Failure rate distribution modelling and correlation structure
+
+# Failure rate of each component [years^(-1)]
+LAMBDA = 0.01
+# Correlation structure
+COPULA_TYPE <- copula::tCopula(param = -0.8, df = 1, dim = N_COMP)
+#copula::normalCopula(param=-0.9, dim = N_COMP)#copula::indepCopula(dim = N_COMP)
+
+# Can try different margins (for instance weibull)
+MARGINS <- rep("exp", N_COMP)
+PARAM_MARGINS <- rep(list(rate=LAMBDA), 2)
+
+# Multivariate distribution from copula
+my_dist <- copula::mvdc(COPULA_TYPE,
+                        margins = MARGINS,
+                        paramMargins = PARAM_MARGINS)
+
+# Sample N_MC_SIM time to failure from the distribution
+sim_ttf <- copula::rMvdc(N_MC_SIM, my_dist)
+```
+
+## Correlation structure visualization
+
+This is a representation of the sampled values of **tf1** and **tf2**. It can be noted that the failure rates are negatively correlated.
+
+```{r}
+psych::pairs.panels(sim_ttf, method="pearson", labels=c("tf1", "tf2"))
+```
+
+
+## Monte Carlo simulation of sistem reliability
+
+Using this model, a Monte Carlo simulation is used to compute the reliability of the system and compare the results with the case of independent failure rates ( $R_s(t) = 2 R(t) - R(t)^2$ ).
+
+```{r}
+#-------------------------------------------------------------------------------
+# Monte Carlo iterations
+
+# Monte Carlo iterations outer loop
+for(k in 1:N_MC_SIM)
+{
+    # Components state matrix: Ncomp x (T_horizon + 1)
+    components_state_matrix = matlab::zeros(N_COMP, T_HORIZON + 1)
+    # Fix equal to 1 element (k, 1) of the state matrix for each row k
+    # since reliability is 1 at beginning of the period
+    components_state_matrix[1:N_COMP, 1] = 1
+
+    # Sample tf for each component
+    for(i in 1:N_COMP)
+    {
+        # Sample tf (tf is in years)
+        #tf = rexp(1, rate=LAMBDA)
+        tf = sim_ttf[k, i]
+        # From year 1 to ceil(tf) component has worked, set 1.
+        # Note that index is shifted! Year 1 is at index 2.
+        components_state_matrix[i, 2:min(ceiling(tf), T_HORIZON + 1)] = 1
+        # From year ceil(tf) to year T_m component has not worked, set 0
+        components_state_matrix[i, min(ceiling(tf) + 1, T_HORIZON + 1):(T_HORIZON + 1)] = 0
+    }
+    
+    # Determine system history.
+    for(i in 2:(T_HORIZON + 1))
+    {
+    
+        # State system at time i is equal to column i of
+        # components_state_matrix
+        current_system_state = components_state_matrix[1:N_COMP, i]
+        
+        # Find if current_system_state is a working state
+        for(j in 1:2^N_COMP)
+        {
+            # This finds the corresponding state from all possible states
+            index_sum = sum(current_system_state == ALL_POSSIBLE_STATES[j, 1:N_COMP])
+            # Once found the corresponding state we exit the loop
+            if(index_sum == N_COMP)
+            {
+                break
+            }
+        }
+    
+        # Corresponding state is the j-th element of SYS_STATES
+        system_status = SYS_STATES[j]
+    
+        # If system_status is 0 system is not working
+        if(system_status == 0)
+        {
+            system_state_matrix[k, i:(T_HORIZON+1)] = 0 
+            break
+        }
+    
+        # Else the system is still working
+        system_state_matrix[k, i] = 1
+    }
+}
+
+#-------------------------------------------------------------------------------
+# Calculate quantities of interest
+
+# System reliability R(t)
+R <- colSums(system_state_matrix)/N_MC_SIM
+
+# MTTF: integrating with unit increment
+MTTF <- sum(R)
+
+# Print results
+
+# Print MTTF
+paste('MTTF correlated case:', MTTF, 'years')
+paste('MTTF independent case:', 1.5*(1/LAMBDA), 'years')
+
+# Estimated probability that system survives 20 years
+paste('Estimated reliability at 20 years', R[21])
+
+#-------------------------------------------------------------------------------
+# Plot results
+
+# Plot of reliability
+plot(0:T_HORIZON, R, type="l", xlab = 'Time [years]', ylab = 'R(t)',
+     main='System Reliability', xlim=c(0 , T_HORIZON), ylim=c(0, 1), col="red")
+
+# Reliability in conditions of indepence betweeen the failure rates: analytical expression
+lines(0:T_HORIZON, 2*exp(-LAMBDA*0:T_HORIZON) - exp(-2*LAMBDA*0:T_HORIZON), col="green")
+
+legend("topright", legend=c("R(t) correlated case (negative correlation)",
+                            "R(t) tfs independent"),
+       col=c("red", "green"), lty=rep(1, 2), cex=0.8)
+```
+
+## Observations
+
+Two observations can be done:
+
+- Reliability increases in a specific time interval due to the negative correlation between the two **tfs**.
+- MTTF increases by about 11 years with respect to the independent case (in this case!).
+
+---
+
+# Reliability and MTTF vs copula parameter
+
+## System reliability vs copula parameter
+
+By changing the correlation between the two *tfs*, reliability and MTTF both change. Changes in the correlation structure are reflected in changes of the copula parameters. In the following, a sweep of the t-copula parameter is performed. The parameter **rho.1** is swept from -0.9 to 0.9 by 0.1 increments.
+
+```{r, echo=FALSE}
+
+simulate_monte_carlo <- function(cop)
+{
+    #-------------------------------------------------------------------------------
+    # Boolean table of the system
+    
+    # Parallel system
+    bool_table <- matrix(c(0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1), nrow=4, ncol=3, byrow = T)
+    
+    #-------------------------------------------------------------------------------
+    
+    # Time horizon considered for reliability calculation [years]
+    T_HORIZON <- 450
+    # Number of Monte Carlo iterations
+    N_MC_SIM <- 5000
+    # Number of system components
+    N_COMP <- ncol(bool_table) - 1
+    # System state matrix
+    system_state_matrix <- matlab::zeros(N_MC_SIM, T_HORIZON + 1)
+    # Fix equal to 1 element k, 1 of the state matrix for each row since R(0)=1
+    system_state_matrix[1:N_MC_SIM, 1] <- 1
+    # All possible existing combinations of system state
+    ALL_POSSIBLE_STATES <- bool_table[, 1:N_COMP]
+    # Working and not working states: working statets are those with 1
+    SYS_STATES <- bool_table[, N_COMP + 1]
+    
+    #-------------------------------------------------------------------------------
+    # Failure rate distribution modelling and correlation structure
+    
+    # Failure rate of each component [years^(-1)]
+    LAMBDA = 0.01
+    # Correlation structure
+    COPULA_TYPE <- cop
+    
+    # Can try different margins (for instance weibull)
+    MARGINS <- rep("exp", N_COMP)
+    PARAM_MARGINS <- rep(list(rate=LAMBDA), 2)
+    
+    # Multivariate distribution from copula
+    my_dist <- copula::mvdc(COPULA_TYPE,
+                            margins = MARGINS,
+                            paramMargins = PARAM_MARGINS)
+    
+    # Sample N_MC_SIM time to failure from the distribution
+    sim_ttf <- copula::rMvdc(N_MC_SIM, my_dist)
+    
+    
+    #-------------------------------------------------------------------------------
+    # Monte Carlo iterations
+    
+    # Monte Carlo iterations outer loop
+    for(k in 1:N_MC_SIM)
+    {
+        # Components state matrix: Ncomp x (T_horizon + 1)
+        components_state_matrix = matlab::zeros(N_COMP, T_HORIZON + 1)
+        # Fix equal to 1 element (k, 1) of the state matrix for each row k
+        # since reliability is 1 at beginning of the period
+        components_state_matrix[1:N_COMP, 1] = 1
+        
+        # Sample tf for each component
+        for(i in 1:N_COMP)
+        {
+            # Sample tf (tf is in years)
+            #tf = rexp(1, rate=LAMBDA)
+            tf = sim_ttf[k, i]
+            # From year 1 to ceil(tf) component has worked, set 1.
+            # Note that index is shifted! Year 1 is at index 2.
+            components_state_matrix[i, 2:min(ceiling(tf), T_HORIZON + 1)] = 1
+            # From year ceil(tf) to year T_m component has not worked, set 0
+            components_state_matrix[i, min(ceiling(tf) + 1, T_HORIZON + 1):(T_HORIZON + 1)] = 0
+        }
+        
+        # Determine system history.
+        for(i in 2:(T_HORIZON + 1))
+        {
+            
+            # State system at time i is equal to column i of
+            # components_state_matrix
+            current_system_state = components_state_matrix[1:N_COMP, i]
+            
+            # Find if current_system_state is a working state
+            for(j in 1:2^N_COMP)
+            {
+                # This finds the corresponding state from all possible states
+                index_sum = sum(current_system_state == ALL_POSSIBLE_STATES[j, 1:N_COMP])
+                # Once found the corresponding state we exit the loop
+                if(index_sum == N_COMP)
+                {
+                    break
+                }
+            }
+            
+            # Corresponding state is the j-th element of SYS_STATES
+            system_status = SYS_STATES[j]
+            
+            # If system_status is 0 system is not working
+            if(system_status == 0)
+            {
+                system_state_matrix[k, i:(T_HORIZON+1)] = 0 
+                break
+            }
+            
+            # Else the system is still working
+            system_state_matrix[k, i] = 1
+        }
+    }
+    
+    #-------------------------------------------------------------------------------
+    # Calculate quantities of interest
+    
+    # System reliability R(t)
+    R <- colSums(system_state_matrix)/N_MC_SIM
+    
+    # MTTF: integrating with unit increment
+    MTTF <- sum(R)
+    
+    # Print results
+    
+    # Print MTTF
+    paste('MTTF correlated case:', MTTF, 'years')
+    paste('MTTF independent case:', 1.5*(1/LAMBDA), 'years')
+    
+    # Estimated probability that system survives 20 years
+    paste('Estimated reliability at 20 years', R[21])
+    
+    return(R)
+}
+
+```
+
+```{r, echo=FALSE}
+
+# For reproducibility
+set.seed(2561)
+
+#-------------------------------------------------------------------------------
+# T copula sweep
+
+copulaparam <- seq(-0.9, 0.9, by = 0.1)
+MTTFS <- numeric(length(copulaparam))
+k <- 1
+for(i in copulaparam)
+{
+    R <- simulate_monte_carlo(copula::tCopula(param = i, df = 1, dim = 2))
+    if(i < -0.8)
+    {
+        plot(0:(length(R)-1), R, type="l", xlab = 'Time [years]', ylab = 'R(t)',
+             main='System Reliability t-copula as rho1 varies', xlim=c(0 , 420), ylim=c(0, 1), col="red")
+    }else
+    {
+        lines(0:(length(R)-1), R, col="red")
+    }
+    
+    MTTFS[k] <- sum(R)
+    k <- k + 1
+}
+
+legend("topright", legend=c("Correlated case(s)",
+                            "Independent case"),
+       col=c("red", "green"), lty=rep(1, 2), cex=0.8, lwd=c(1,2))
+
+T_HORIZON <- 450
+LAMBDA <- 0.01
+lines(0:T_HORIZON, 2*exp(-LAMBDA*0:T_HORIZON) - exp(-2*LAMBDA*0:T_HORIZON), col="green", lwd=2)
+
+plot(copulaparam, MTTFS, type="l", col="blue", lwd=2, main="MTTF vs t-copula parameter rho1", xlab="rho1")
+lines(copulaparam, rep(150, length(copulaparam)), col="green", lwd=2)
+legend("bottomleft", legend=c("MTTF correlated case",
+                              "MMTF tfs independent (reference)"),
+       col=c("blue", "green"), lty=rep(1, 2), cex=0.8, lwd=2)
+
+
+```
+
+
+
+```{r, echo=FALSE, eval=FALSE}
+#-------------------------------------------------------------------------------
+# Normal copula sweep
+
+copulaparam <- seq(-0.9, 0.9, by = 0.1)
+MTTFS <- numeric(length(copulaparam))
+k <- 1
+for(i in copulaparam)
+{
+    R <- simulate_monte_carlo(copula::normalCopula(param=i, dim = 2))
+    if(i < -0.8)
+    {
+        plot(0:(length(R)-1), R, type="l", xlab = 'Time [years]', ylab = 'R(t)',
+             main='System Reliability gauss copula as rho varies', xlim=c(0 , 420), ylim=c(0, 1), col="red")
+    }else
+    {
+        lines(0:(length(R)-1), R, col="red")
+    }
+    
+    MTTFS[k] <- sum(R)
+    k <- k + 1
+}
+
+legend("topright", legend=c("Correlated case(s)",
+                            "Independent case (reference)"),
+       col=c("red", "green"), lty=rep(1, 2), cex=0.8, lwd=c(1,2))
+
+T_HORIZON <- 450
+LAMBDA <- 0.01
+lines(0:T_HORIZON, 2*exp(-LAMBDA*0:T_HORIZON) - exp(-2*LAMBDA*0:T_HORIZON), col="green", lwd=2)
+
+plot(copulaparam, MTTFS, type="l", col="blue", lwd=2, main="MTTF vs gaussian copula parameter rho", xlab="rho")
+lines(copulaparam, rep(150, length(copulaparam)), col="green", lwd=2)
+legend("bottomleft", legend=c("MTTF correlated case",
+                            "MMTF tfs independent"),
+       col=c("blue", "green"), lty=rep(1, 2), cex=0.8, lwd=2)
+
+
+# #-------------------------------------------------------------------------------
+# # What do samples look like?
+# 
+# for(i in seq(-0.9, 0.9, 0.1))
+# {
+#     COPULA_TYPE <- copula::normalCopula(param=i, dim = 2)
+#     
+#     # Can try different margins (for instance weibull)
+#     MARGINS <- rep("exp", 2)
+#     PARAM_MARGINS <- rep(list(rate=LAMBDA), 2)
+#     
+#     # Multivariate distribution from copula
+#     my_dist <- copula::mvdc(COPULA_TYPE,
+#                             margins = MARGINS,
+#                             paramMargins = PARAM_MARGINS)
+#     
+#     # Sample N_MC_SIM time to failure from the distribution
+#     sim_ttf <- copula::rMvdc(1000, my_dist)
+#     
+#     psych::pairs.panels(sim_ttf, method="pearson", labels=c("tf1", "tf2"))
+# }
+
+```
+
+A similar sweep could be performed by keeping **rho.1** fixed and varying the parameter **df**.
+
+---
+
+## Next steps
+
+The next steps can be the following
+
+- Apply the model to a real system.
+- ...
